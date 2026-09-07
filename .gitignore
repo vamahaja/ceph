@@ -84,6 +84,10 @@ GTAGS
 /src/python-common/build/
 .cache
 
+# Hermetic mock lock + offline RPM repo (large; regenerable via hermetic-lock)
+rpmbuild/hermetic/
+rpmbuild/hermetic-calc-*/
+
 # Doc build output
 src/pybind/cephfs/build/
 src/pybind/cephfs/cephfs.c
