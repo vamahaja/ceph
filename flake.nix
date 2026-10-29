@@ -100,7 +100,8 @@
               echo " Tests:  nix develop -c ./nix/build-driver.sh tests"
               echo " Debs:   nix develop .#packages -c ./nix/build-driver.sh debs"
               echo " Image:  nix develop .#packages -c ./nix/build-driver.sh fedora-image  # Dockerfile.build"
-              echo " RPM:    nix develop .#packages -c ./nix/build-driver.sh rpm  # BWC-style rpmbuild"
+              echo " RPM:    nix develop .#packages -c ./nix/build-driver.sh rpm  # BWC rpmbuild"
+              echo " Hermetic: RPM_BUILDER=hermetic ... build-driver.sh rpm  # mock offline"
               echo "=========================================================="
             '';
           };

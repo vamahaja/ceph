@@ -186,11 +186,14 @@ Apps bundle the required packages and environment variables. They are convenient
 | `CEPH_VERSION` | (from git) | Version string for package builds |
 | `DEB_DISTRO` | `noble` | Target distro codename for `make-debs.sh` |
 | `RPM_BACKEND` | `container` | RPM path: `container` (Fedora OCI) or `nix` (legacy in-shell) |
-| `RPM_BUILDER` | `rpmbuild` | Binary builder: `rpmbuild` (BWC default) or `mock` |
+| `RPM_BUILDER` | `rpmbuild` | `rpmbuild` (BWC), `mock`, or `hermetic` (offline mock) |
 | `FEDORA_IMAGE` | auto (`ceph-fedora-rpm:43` if present) | Image used when `RPM_BACKEND=container` |
 | `FEDORA_BASE_IMAGE` | `registry.fedoraproject.org/fedora:43` | `FROM` for `Dockerfile.build` |
-| `MOCK_CONFIG` | `fedora-<ver>-<arch>` from image | mock chroot config when `RPM_BUILDER=mock` |
+| `MOCK_CONFIG` | `fedora-<ver>-<arch>` from image | mock chroot config (`mock` / `hermetic`) |
 | `MOCK_BUILDHOST` | `ceph-nix-mock` | Fixed RPM `%_buildhost` |
+| `HERMETIC_REPO_DIR` | `hermetic-repo` | Offline RPM repo for `RPM_BUILDER=hermetic` |
+| `HERMETIC_LOCKFILE` | `rpmbuild/buildroot_lock.json` | Mock buildroot lockfile path |
+| `HERMETIC_FORCE_REFRESH` | `0` | Set `1` to redo calculate-deps / repo fetch |
 | `SOURCE_DATE_EPOCH` | flake `lastModified` (or git) | Reproducible timestamps for rpmbuild/mock |
 | `CONTAINER_RUNTIME` | (auto: podman, else docker) | Override container CLI |
 
@@ -234,7 +237,7 @@ podman build --pull -f Dockerfile.build \
   -t ceph-fedora-rpm:43 .
 ```
 
-Inside the image build, `buildcontainer-setup.sh` installs `rpmbuild`/`wget`/`curl`, then `install-deps.sh` runs **`dnf builddep ceph.spec`** (full BuildRequires), matching BWC.
+Inside the image build, `buildcontainer-setup.sh` installs `rpmbuild`/`wget`/`curl`, then `install-deps.sh` runs **`dnf builddep ceph.spec`** (full BuildRequires), matching BWC. The image build also installs **mock**, **mock-core-configs**, and **mock-hermetic-repo** (mock ≥ 5.7) for hermetic RPM builds.
 
 ### Container RPM build
 
@@ -242,13 +245,30 @@ Inside the image build, `buildcontainer-setup.sh` installs `rpmbuild`/`wget`/`cu
 2. `podman run` with `ceph-fedora-rpm:43` (or `FEDORA_IMAGE`) and `/src` bind-mount
 3. `./make-srpm.sh`
 4. Default: `rpmbuild --rebuild` (BWC) with reproducible-timestamp macros
-5. Optional: `RPM_BUILDER=mock` for mock chroot rebuilds
+5. Optional: `RPM_BUILDER=mock` for online mock chroot rebuilds
+6. Optional: `RPM_BUILDER=hermetic` for offline/pinned Fedora RPM rebuilds (below)
 
 ```
 nix develop .#packages -c ./nix/build-driver.sh fedora-image
 nix develop .#packages -c ./nix/build-driver.sh rpm
 RPM_BUILDER=mock nix develop .#packages -c ./nix/build-driver.sh rpm
 ```
+
+### Hermetic mock RPM build (`RPM_BUILDER=hermetic`)
+
+Pins **Fedora BuildRequires** via a mock lockfile and local repo, then rebuilds offline. Nix only orchestrates; this does **not** link against nixpkgs libraries.
+
+```
+nix develop .#packages -c ./nix/build-driver.sh fedora-image
+RPM_BUILDER=hermetic nix develop .#packages -c ./nix/build-driver.sh rpm
+```
+
+Flow:
+
+1. **Online prepare** (network allowed, privileged container): `make-srpm` → `mock --calculate-build-dependencies` → `buildroot_lock.json` → `mock-hermetic-repo` into `hermetic-repo/`
+2. **Offline build**: `podman run --network=none --privileged` → `mock --hermetic-build $lockfile $repo $srpm`
+
+Artifacts: `rpmbuild/buildroot_lock.json`, `hermetic-repo/` (large; gitignored), binary RPMs under `rpmbuild/`. Reuse lockfile+repo when the SRPM/MOCK_CONFIG/`SOURCE_DATE_EPOCH` stamp matches; force refresh with `HERMETIC_FORCE_REFRESH=1`.
 
 Legacy in-shell rebuild (not recommended):
 
