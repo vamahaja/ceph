@@ -655,6 +655,7 @@ run_rpm_on_host() {
 # Hermetic lock on the current node (same steps as thin-image hermetic-lock, paths on CEPH_ROOT).
 run_rpm_hermetic_lock_on_host() {
   local mock_cfg srpm hdir calcdir stock_bootstrap bootstrap_image mock_cfg_file lockfile repo_rc
+  local -a as_root=()
 
   CEPH_VERSION="$(ceph_rpm_version)"
   export CEPH_VERSION
@@ -665,6 +666,10 @@ run_rpm_hermetic_lock_on_host() {
   export DISTRO
 
   require_host_hermetic_tools
+  # Mock inspects and imports bootstrap images as root, even when invoked by Jenkins.
+  if (( EUID != 0 )); then
+    as_root=(sudo -n --)
+  fi
 
   hdir="$(hermetic_dir)"
   calcdir="$CEPH_ROOT/rpmbuild/hermetic-calc-${DISTRO}"
@@ -720,16 +725,14 @@ print(values[-1])
 PY
 )"
   bootstrap_image="$stock_bootstrap"
-  if podman pull "$stock_bootstrap" >/dev/null; then
-    :
-  fi
-  if podman run --rm "$stock_bootstrap" bash -lc \
+  "${as_root[@]}" podman pull "$stock_bootstrap" >/dev/null
+  if "${as_root[@]}" podman run --rm "$stock_bootstrap" bash -lc \
       'rpm -q python3-dnf-plugins-core >/dev/null 2>&1 || rpm -q dnf5-plugins >/dev/null 2>&1'; then
     echo "Bootstrap image already ready: $stock_bootstrap"
   else
     bootstrap_image="localhost/ceph-mock-bootstrap:${DISTRO}"
     echo "Stock bootstrap lacks builddep plugins; building ready image $bootstrap_image"
-    podman build -t "$bootstrap_image" - <<EOF
+    "${as_root[@]}" podman build -t "$bootstrap_image" - <<EOF
 FROM ${stock_bootstrap}
 RUN set -eux; \\
     if command -v dnf5 >/dev/null 2>&1; then \\
@@ -745,6 +748,7 @@ EOF
   write_ceph_nix_mock_cfg "$mock_cfg_file" "$mock_cfg" \
 "config_opts['use_bootstrap_image'] = True
 config_opts['bootstrap_image'] = '${bootstrap_image}'
+config_opts['bootstrap_image_skip_pull'] = True
 config_opts['bootstrap_image_ready'] = True"
 
   echo "Calculating build deps for $srpm (online) bootstrap=$bootstrap_image"
@@ -756,12 +760,10 @@ config_opts['bootstrap_image_ready'] = True"
     ls -la "$calcdir" >&2 || true
     exit 1
   fi
-  cp -f "$lockfile" "$hdir/buildroot_lock.json"
-
-  python3 - <<'PY'
-import json, os, re
+  python3 - "$lockfile" <<'PY'
+import json, re, sys
 from urllib.parse import urlparse, urlunparse
-path = f"{os.environ['CEPH_ROOT']}/rpmbuild/hermetic/{os.environ['DISTRO']}/buildroot_lock.json"
+path = sys.argv[1]
 with open(path) as f:
     data = json.load(f)
 n = 0
@@ -781,10 +783,11 @@ if n:
 PY
 
   echo "Fetching hermetic repo into $hdir/repo"
+  rm -f "$hdir/buildroot_lock.json"
   rm -rf "$hdir/repo"
   mkdir -p "$hdir/repo"
   set +e
-  mock-hermetic-repo --lockfile "$hdir/buildroot_lock.json" --output-repo "$hdir/repo"
+  mock-hermetic-repo --lockfile "$lockfile" --output-repo "$hdir/repo"
   repo_rc=$?
   set -e
   if [ ! -d "$hdir/repo/repodata" ]; then
@@ -792,30 +795,37 @@ PY
     exit 1
   fi
 
-  export CEPH_ROOT
-  python3 - <<'PY'
-import json, os, pathlib, shutil, subprocess
-root = os.environ["CEPH_ROOT"]
-distro = os.environ["DISTRO"]
-lock = pathlib.Path(f"{root}/rpmbuild/hermetic/{distro}/buildroot_lock.json")
-repo = pathlib.Path(f"{root}/rpmbuild/hermetic/{distro}/repo")
+  python3 - "$lockfile" "$hdir/repo" "${as_root[@]}" <<'PY'
+import json, pathlib, shutil, subprocess, sys
+lock, repo = map(pathlib.Path, sys.argv[1:3])
+as_root = sys.argv[3:]
 data = json.loads(lock.read_text())
 image = data["config"]["bootstrap_image"]
-pull = data["bootstrap"]["pull_digest"]
+bootstrap = data["bootstrap"]
+pull = bootstrap["pull_digest"]
+image_id = bootstrap["id"].removeprefix("sha256:")
 name = image.split(":", 1)[0]
 dest = repo / f"{name}@{pull}"
 if dest.exists():
     shutil.rmtree(dest)
 dest.mkdir(parents=True)
 cmd = [
-    "skopeo", "copy",
-    f"containers-storage:{image}",
+    *as_root, "skopeo", "copy",
+    f"containers-storage:@{image_id}",
     f"dir:{dest}",
 ]
-print("Exporting bootstrap:", " ".join(cmd))
+print(f"Exporting locked bootstrap {image} ({image_id})", flush=True)
 subprocess.check_call(cmd)
-print("Bootstrap exported to", dest)
+# Import the bundle exactly as Mock will and verify the image config (which
+# includes the root filesystem layer IDs) still matches the locked image.
+imported_id = subprocess.check_output(
+    [*as_root, "podman", "pull", "--quiet", f"dir:{dest}"], text=True
+).strip().removeprefix("sha256:")
+if imported_id != image_id:
+    raise SystemExit(f"error: exported bootstrap image ID {imported_id}; expected {image_id}")
+print("Verified bootstrap image in", dest)
 PY
+  cp -f "$lockfile" "$hdir/buildroot_lock.json"
 
   echo "Hermetic lock ready (on-host):"
   echo "  lock: $hdir/buildroot_lock.json"
