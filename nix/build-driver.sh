@@ -887,7 +887,9 @@ EOF
   echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH hermetic package rebuild of $srpm (on-host)"
   echo "  lock: $lockfile"
   echo "  repo: $repodir"
-  mock --resultdir="$topdir" --hermetic-build "$lockfile" "$repodir" "$srpm"
+  # Place the chroots on the workspace volume along with the RPM outputs.
+  mock --config-opts "basedir=$topdir/mock" --resultdir="$topdir" \
+    --hermetic-build "$lockfile" "$repodir" "$srpm"
 }
 
 # Online: resolve BuildRequires into buildroot_lock.json + local RPM repo.
